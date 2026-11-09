@@ -365,6 +365,49 @@ export function buildPackagedHtmlAsset(
 <meta name="application-name" content="${config.appName.replace(/"/g, '&quot;')}" />
 ${extraStyles}
 <script>
+  (function() {
+    function ensureLocalSafeStorage(propName) {
+      try {
+        var st = window[propName];
+        var tk = '__webapk_st_test__';
+        st.setItem(tk, '1');
+        st.removeItem(tk);
+      } catch (_e) {
+        var mem = {};
+        var fake = {
+          getItem: function(k) { return Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null; },
+          setItem: function(k, v) { mem[String(k)] = String(v); },
+          removeItem: function(k) { delete mem[String(k)]; },
+          clear: function() { mem = {}; },
+          key: function(i) { return Object.keys(mem)[i] || null; },
+          get length() { return Object.keys(mem).length; }
+        };
+        try { Object.defineProperty(window, propName, { value: fake, configurable: true }); } catch (__e) {}
+      }
+    }
+    ensureLocalSafeStorage('localStorage');
+    ensureLocalSafeStorage('sessionStorage');
+
+    try {
+      var origPush = history.pushState;
+      var origReplace = history.replaceState;
+      history.pushState = function(state, title, url) {
+        try { return origPush.apply(history, arguments); } catch (_e) {
+          if (url && typeof url === 'string' && !url.startsWith('#')) {
+            try { window.location.hash = url; } catch (__e) {}
+          }
+        }
+      };
+      history.replaceState = function(state, title, url) {
+        try { return origReplace.apply(history, arguments); } catch (_e) {
+          if (url && typeof url === 'string' && !url.startsWith('#')) {
+            try { window.location.hash = url; } catch (__e) {}
+          }
+        }
+      };
+    } catch (_hErr) {}
+  })();
+
   window.__WEBAPK_MANIFEST__ = {
     appName: ${safeJson(config.appName)},
     packageName: ${safeJson(config.packageName)},

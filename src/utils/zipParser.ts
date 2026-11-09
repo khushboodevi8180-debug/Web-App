@@ -29,12 +29,12 @@ export interface ImportedZipProject {
 const TEXT_EXTENSIONS = new Set([
   'html', 'htm', 'xhtml', 'css', 'scss', 'less', 'js', 'mjs', 'cjs',
   'ts', 'tsx', 'jsx', 'json', 'xml', 'svg', 'md', 'txt', 'csv',
-  'yaml', 'yml', 'toml', 'ini', 'glsl', 'frag', 'vert', 'obj', 'mtl'
+  'yaml', 'yml', 'toml', 'ini', 'glsl', 'frag', 'vert', 'obj', 'mtl', 'atlas'
 ]);
 
 const DATA_TEXT_EXTENSIONS = new Set([
   'json', 'xml', 'csv', 'txt', 'md', 'yaml', 'yml', 'toml', 'ini',
-  'glsl', 'frag', 'vert', 'obj', 'mtl'
+  'glsl', 'frag', 'vert', 'obj', 'mtl', 'atlas'
 ]);
 
 function getExtension(filePath: string): string {
@@ -286,7 +286,7 @@ export async function parseZipProjectArchive(
 <body>
   <div id="root"></div>
   <div id="app"></div>
-  ${mainScript ? `<script type="module" src="${mainScript.path}"></script>` : ''}
+  ${mainScript ? `<script src="${mainScript.path}"></script>` : ''}
 </body>
 </html>`;
     const enc = new TextEncoder();
@@ -366,9 +366,151 @@ function normalizePath(p: string, baseDir = ''): string {
 }
 
 /**
+ * Converts ES Module syntax (import / export / dynamic import / import.meta) into
+ * synchronous CommonJS (__zipRequire / exports / module.exports) so that multi-file
+ * JS modules in a .ZIP archive can run inside a standard classic <script> on file://
+ * and Android WebView without any CORS or blob: module errors.
+ */
+function transformEsmToCommonJs(rawCode: string): string {
+  let code = rawCode;
+
+  // Replace import.meta.env and import.meta.url so they never throw SyntaxError inside a classic <script>
+  code = code.replace(
+    /\bimport\.meta\.env\b/g,
+    '({ MODE: "production", DEV: false, PROD: true, BASE_URL: "./" })'
+  );
+  code = code.replace(/\bimport\.meta\.url\b/g, 'window.location.href');
+  code = code.replace(/\bimport\.meta\b/g, '({ url: window.location.href, env: { MODE: "production", DEV: false, PROD: true, BASE_URL: "./" } })');
+
+  // Replace dynamic import(...) with __zipDynamicImport(...)
+  code = code.replace(/\bimport\s*\(/g, '__zipDynamicImport(');
+
+  // 1. Side-effect only imports: import "foo";
+  code = code.replace(
+    /(^|[\r\n;])\s*import\s+["']([^"']+)["']\s*;?/g,
+    (_m, pre, spec) => `${pre}__zipRequire(${JSON.stringify(spec)});`
+  );
+
+  // 2. Namespace imports: import * as ns from "foo";
+  code = code.replace(
+    /(^|[\r\n;])\s*import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+["']([^"']+)["']\s*;?/g,
+    (_m, pre, ns, spec) => `${pre}const ${ns} = __zipRequire(${JSON.stringify(spec)});`
+  );
+
+  // 3. Default + Named imports: import Def, { a, b as c } from "foo";
+  code = code.replace(
+    /(^|[\r\n;])\s*import\s+([A-Za-z_$][\w$]*)\s*,\s*\{([^}]*)\}\s*from\s+["']([^"']+)["']\s*;?/g,
+    (_m, pre, defName, namedList, spec) => {
+      const normalizedNamed = namedList.replace(/\bas\b/g, ':');
+      return `${pre}const __imp_${defName} = __zipRequire(${JSON.stringify(spec)}); const ${defName} = __imp_${defName} && __imp_${defName}.__esModule ? __imp_${defName}.default : __imp_${defName}; const { ${normalizedNamed} } = __imp_${defName} || {};`;
+    }
+  );
+
+  // 4. Default + Namespace imports: import Def, * as ns from "foo";
+  code = code.replace(
+    /(^|[\r\n;])\s*import\s+([A-Za-z_$][\w$]*)\s*,\s*\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+["']([^"']+)["']\s*;?/g,
+    (_m, pre, defName, ns, spec) =>
+      `${pre}const ${ns} = __zipRequire(${JSON.stringify(spec)}); const ${defName} = ${ns} && ${ns}.__esModule ? ${ns}.default : ${ns};`
+  );
+
+  // 5. Named imports: import { a, b as c } from "foo";
+  code = code.replace(
+    /(^|[\r\n;])\s*import\s+\{([^}]*)\}\s*from\s+["']([^"']+)["']\s*;?/g,
+    (_m, pre, namedList, spec) => {
+      // Strip TypeScript `type` keyword inside named imports: import { type Foo, Bar }
+      const cleanedItems = namedList
+        .split(',')
+        .map((s: string) => s.trim())
+        .filter((s: string) => s && !/^type\s+/i.test(s))
+        .map((s: string) => s.replace(/\bas\b/g, ':'))
+        .join(', ');
+      if (!cleanedItems) return `${pre}`;
+      return `${pre}const { ${cleanedItems} } = __zipRequire(${JSON.stringify(spec)}) || {};`;
+    }
+  );
+
+  // 6. Default imports: import Def from "foo";
+  code = code.replace(
+    /(^|[\r\n;])\s*import\s+([A-Za-z_$][\w$]*)\s+from\s+["']([^"']+)["']\s*;?/g,
+    (_m, pre, defName, spec) => {
+      if (defName === 'type') return `${pre}`;
+      return `${pre}const __imp_${defName} = __zipRequire(${JSON.stringify(spec)}); const ${defName} = __imp_${defName} && __imp_${defName}.__esModule ? __imp_${defName}.default : __imp_${defName};`;
+    }
+  );
+
+  // 7. Re-exports: export * from "foo";
+  code = code.replace(
+    /(^|[\r\n;])\s*export\s+\*\s+from\s+["']([^"']+)["']\s*;?/g,
+    (_m, pre, spec) => `${pre}Object.assign(exports, __zipRequire(${JSON.stringify(spec)}));`
+  );
+
+  // 8. Named re-exports: export { a, b as c } from "foo";
+  code = code.replace(
+    /(^|[\r\n;])\s*export\s+\{([^}]*)\}\s*from\s+["']([^"']+)["']\s*;?/g,
+    (_m, pre, list, spec) => {
+      const pairs = list
+        .split(',')
+        .map((s: string) => s.trim())
+        .filter(Boolean)
+        .map((item: string) => {
+          const parts = item.split(/\s+as\s+/);
+          const orig = parts[0].trim();
+          const alias = (parts[1] || orig).trim();
+          return `exports.${alias} = __reexp.${orig};`;
+        })
+        .join(' ');
+      return `${pre}{ const __reexp = __zipRequire(${JSON.stringify(spec)}) || {}; ${pairs} }`;
+    }
+  );
+
+  // 9. Local export list: export { a, b as c };
+  code = code.replace(
+    /(^|[\r\n;])\s*export\s+\{([^}]*)\}\s*;?/g,
+    (_m, pre, list) => {
+      const assigns = list
+        .split(',')
+        .map((s: string) => s.trim())
+        .filter((s: string) => s && !/^type\s+/i.test(s))
+        .map((item: string) => {
+          const parts = item.split(/\s+as\s+/);
+          const orig = parts[0].trim();
+          const alias = (parts[1] || orig).trim();
+          return `exports.${alias} = ${orig};`;
+        })
+        .join(' ');
+      return `${pre}${assigns}`;
+    }
+  );
+
+  // 10. export default function / class / expression
+  code = code.replace(
+    /(^|[\r\n;])\s*export\s+default\s+/g,
+    (_m, pre) => `${pre}exports.default = `
+  );
+
+  // 11. export const / let / var
+  code = code.replace(
+    /(^|[\r\n;])\s*export\s+(const|let|var)\s+([A-Za-z_$][\w$]*)/g,
+    (_m, pre, kw, id) => `${pre}${kw} ${id} = exports.${id}`
+  );
+
+  // 12. export async function / export function / export class
+  code = code.replace(
+    /(^|[\r\n;])\s*export\s+(async\s+)?function\s+([A-Za-z_$][\w$]*)/g,
+    (_m, pre, asyncKw, id) => `${pre}exports.${id} = ${asyncKw || ''}function ${id}`
+  );
+  code = code.replace(
+    /(^|[\r\n;])\s*export\s+class\s+([A-Za-z_$][\w$]*)/g,
+    (_m, pre, id) => `${pre}exports.${id} = class ${id}`
+  );
+
+  return `Object.defineProperty(exports, "__esModule", { value: true });\n${code}`;
+}
+
+/**
  * Resolves relative CSS, JS, TypeScript/React (.tsx/.jsx/.ts), ES Modules, and Image/Media references
- * from an imported multi-file ZIP project so that the entry HTML document runs seamlessly inside
- * a sandboxed iframe and Android/Windows/Linux WebView without showing raw code or a white screen.
+ * from an imported multi-file ZIP project so that the entry HTML document runs 100% locally (file://,
+ * Android WebView file:///android_asset/www/index.html, Windows .exe, Linux .deb, and sandboxed iframes).
  */
 export function bundleMultiFileHtmlProject(
   projectOrFiles: ImportedZipProject | ProjectFileEntry[],
@@ -399,7 +541,8 @@ export function bundleMultiFileHtmlProject(
   const entryDir = entryFile?.folder && entryFile.folder !== '/' ? entryFile.folder : '';
 
   // Only accept htmlOverrideOrEntryPath if it is an authentic HTML document (not JS/TSX/CSS source)
-  const trimmedOverride = typeof htmlOverrideOrEntryPath === 'string' ? htmlOverrideOrEntryPath.trim() : '';
+  const trimmedOverride =
+    typeof htmlOverrideOrEntryPath === 'string' ? htmlOverrideOrEntryPath.trim() : '';
   const looksLikeGenuineHtml =
     trimmedOverride.length > 0 &&
     (/^(<!doctype\s+html|<html\b|<head\b|<body\b|<!--)/i.test(trimmedOverride) ||
@@ -410,7 +553,7 @@ export function bundleMultiFileHtmlProject(
           trimmedOverride
         )));
 
-  let html = looksLikeGenuineHtml
+  const html = looksLikeGenuineHtml
     ? htmlOverrideOrEntryPath!
     : entryFile?.textContent || '';
 
@@ -491,7 +634,6 @@ export function bundleMultiFileHtmlProject(
       }
     );
 
-    // Ensure CSS never contains a literal </style> tag that could close <style> early
     return processed.replace(/<\/style/gi, '<\\/style');
   };
 
@@ -504,7 +646,6 @@ export function bundleMultiFileHtmlProject(
   );
 
   // Build Virtual Asset Map for binary media (images, audio, video, fonts, SVGs) and data files (.json, .txt, .csv, .xml)
-  // NOTE: Never include .html, .js, .ts, .tsx, or .css source files in assetTextMap!
   const assetDataUrlMap: Record<string, string> = {};
   const assetTextMap: Record<string, string> = {};
 
@@ -534,18 +675,18 @@ export function bundleMultiFileHtmlProject(
         out = out.split(`'${assetPath}'`).join(`'${dataUrl}'`);
       }
     }
-    // Escape any literal </script so an inline <script> tag is never closed prematurely by JS strings
     return out.replace(/<\/script/gi, '<\\/script');
   };
 
   const entryScriptsToRun: string[] = [];
   const inlinedCssPaths = new Set<string>();
 
-  // Use DOMParser when available in the browser so we only touch real HTML elements
-  // and NEVER match <link>, <script>, </head>, or </body> strings inside JS code!
   if (typeof DOMParser !== 'undefined') {
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
+
+    // Remove any <base> tag or <link rel="modulepreload"> that breaks local file:// resolution
+    doc.querySelectorAll('base, link[rel="modulepreload"]').forEach((el) => el.remove());
 
     // 1. Replace <link rel="stylesheet" href="..."> with <style> elements
     const links = Array.from(doc.querySelectorAll('link[href]'));
@@ -570,6 +711,9 @@ export function bundleMultiFileHtmlProject(
           const b64 = uint8ToBase64(iconFile.binaryData);
           linkEl.setAttribute('href', `data:${iconFile.mimeType};base64,${b64}`);
         }
+      } else if (rel.includes('manifest')) {
+        // Remove webmanifest link on file:// to avoid CORS errors in local browsers
+        linkEl.remove();
       }
     }
 
@@ -587,7 +731,7 @@ export function bundleMultiFileHtmlProject(
       }
     }
 
-    // 3. Process <script src="..."> elements
+    // 3. Process <script src="..."> elements so they run 100% locally (without file:// CORS errors)
     const scriptEls = Array.from(doc.querySelectorAll('script[src]'));
     for (const scriptEl of scriptEls) {
       const src = scriptEl.getAttribute('src') || '';
@@ -602,40 +746,80 @@ export function bundleMultiFileHtmlProject(
       const isInHead = Boolean(scriptEl.closest('head'));
       const isTsxOrJsx = /\.(tsx|ts|jsx)$/i.test(scriptFile.name);
 
-      // Check if this script uses ES module imports/exports that reference other files in the ZIP
-      const hasModuleSyntax =
-        /\bimport\s+(?:[\w*{}\s,]+\s+from\s+)?["'][^"']+["']/.test(scriptFile.textContent) ||
-        /\bimport\s*\(/.test(scriptFile.textContent) ||
-        /\bexport\s+(?:default|const|let|var|function|class|\{|\*)/.test(scriptFile.textContent);
+      // Check if this script imports other files from the ZIP or uses ES module syntax
+      const hasStaticImportOrExport =
+        /(^|[\r\n;])\s*import\s+(?:[\w*{}\s,]+\s+from\s+)?["'][^"']+["']/.test(
+          scriptFile.textContent
+        ) ||
+        /(^|[\r\n;])\s*export\s+(?:default|const|let|var|function|class|\{|\*)/.test(
+          scriptFile.textContent
+        );
 
-      if (isTsxOrJsx || (isModule && hasModuleSyntax)) {
+      if (isTsxOrJsx || hasStaticImportOrExport) {
         entryScriptsToRun.push(scriptFile.path);
         scriptEl.remove();
         continue;
       }
 
-      const processedJs = replaceAssetPathsInJs(scriptFile.textContent);
+      // Single self-contained JS script (including single-bundle Vite/Rollup scripts that had type="module"):
+      // Run as a standard classic <script> (NO type="module" so it never triggers file:// CORS blocks!)
+      let processedJs = replaceAssetPathsInJs(scriptFile.textContent);
+      // Replace any import.meta references inside Vite bundles so they work in classic <script>
+      processedJs = processedJs
+        .replace(
+          /\bimport\.meta\.env\b/g,
+          '({ MODE: "production", DEV: false, PROD: true, BASE_URL: "./" })'
+        )
+        .replace(/\bimport\.meta\.url\b/g, 'window.location.href')
+        .replace(
+          /\bimport\.meta\b/g,
+          '({ url: window.location.href, env: { MODE: "production", DEV: false, PROD: true, BASE_URL: "./" } })'
+        );
+
       const inlineScript = doc.createElement('script');
       inlineScript.setAttribute('data-zip-script', scriptFile.path);
 
-      if (isModule) {
-        inlineScript.setAttribute('type', 'module');
-        inlineScript.textContent = processedJs;
-        scriptEl.replaceWith(inlineScript);
-      } else if (isInHead && isDeferred) {
-        // Deferred script in <head>: append to the end of <body> so it runs after DOM elements exist
-        inlineScript.textContent = processedJs;
+      if (isModule || (isInHead && isDeferred)) {
+        // Place deferred / module bundles at the end of <body> as a classic <script> IIFE
+        // so <body> (<div id="root">, etc.) is already mounted AND it runs locally on file://!
+        inlineScript.textContent = `(function(){\n${processedJs}\n})();`;
         scriptEl.remove();
         doc.body.appendChild(inlineScript);
       } else if (isInHead) {
-        // Classic script in <head> without defer: run immediately (for libraries like jQuery/Three.js),
-        // and if it fails because document.body is not ready yet, automatically re-run on DOMContentLoaded!
+        // Classic script in <head> without defer: run immediately (for libraries like jQuery/Three.js/GSAP),
+        // and if it fails because document.body is null, automatically re-run on DOMContentLoaded!
         inlineScript.textContent = `try {\n${processedJs}\n} catch (__zipHeadErr) {\n  if (!document.body) {\n    window.addEventListener('DOMContentLoaded', function() {\n${processedJs}\n    });\n  } else {\n    console.error(__zipHeadErr);\n  }\n}`;
         scriptEl.replaceWith(inlineScript);
       } else {
-        // Classic script in <body>: inline directly in exact document order
         inlineScript.textContent = processedJs;
         scriptEl.replaceWith(inlineScript);
+      }
+    }
+
+    // Also convert any inline <script type="module"> in index.html into a local-safe classic <script>
+    const inlineModuleScripts = Array.from(doc.querySelectorAll('script[type="module"]:not([src])'));
+    for (const modEl of inlineModuleScripts) {
+      const rawInlineCode = modEl.textContent || '';
+      const hasImports = /(^|[\r\n;])\s*import\s+/.test(rawInlineCode);
+      if (hasImports) {
+        const virtualInlinePath = '__inline_module_' + entryScriptsToRun.length + '.js';
+        files.push({
+          path: virtualInlinePath,
+          name: virtualInlinePath,
+          folder: entryDir || '/',
+          sizeBytes: rawInlineCode.length,
+          isText: true,
+          textContent: rawInlineCode,
+          binaryData: new Uint8Array(0),
+          bytes: new Uint8Array(0),
+          mimeType: 'application/javascript'
+        });
+        entryScriptsToRun.push(virtualInlinePath);
+        modEl.remove();
+      } else {
+        const classicEl = doc.createElement('script');
+        classicEl.textContent = `(function(){\n${replaceAssetPathsInJs(rawInlineCode)}\n})();`;
+        modEl.replaceWith(classicEl);
       }
     }
 
@@ -659,11 +843,74 @@ export function bundleMultiFileHtmlProject(
       doc.head.appendChild(twEl);
     }
 
-    // 6. Inject Virtual ZIP File System runtime into <head> using safeJsonForHtmlScript
-    // (contains ZERO '<' or '>' characters inside the JSON literals!)
+    // 6. Inject 100% Local-First Virtual ZIP File System & file:// Compatibility Shims into <head>
     const vfsEl = doc.createElement('script');
     vfsEl.id = 'webapk-zip-vfs';
     vfsEl.textContent = `(function() {
+  // A. Local file:// Web Storage (localStorage / sessionStorage) fallback shim
+  function ensureStorage(propName) {
+    try {
+      var st = window[propName];
+      var testKey = '__webapk_storage_test__';
+      st.setItem(testKey, '1');
+      st.removeItem(testKey);
+    } catch (e) {
+      var mem = {};
+      var fakeStorage = {
+        getItem: function(k) { return Object.prototype.hasOwnProperty.call(mem, k) ? mem[k] : null; },
+        setItem: function(k, v) { mem[String(k)] = String(v); },
+        removeItem: function(k) { delete mem[String(k)]; },
+        clear: function() { mem = {}; },
+        key: function(i) { return Object.keys(mem)[i] || null; },
+        get length() { return Object.keys(mem).length; }
+      };
+      try {
+        Object.defineProperty(window, propName, { value: fakeStorage, configurable: true });
+      } catch (_err) {}
+    }
+  }
+  ensureStorage('localStorage');
+  ensureStorage('sessionStorage');
+
+  // B. Local file:// History API (pushState / replaceState) & ServiceWorker safety shim
+  try {
+    var origPushState = history.pushState;
+    var origReplaceState = history.replaceState;
+    history.pushState = function(state, title, url) {
+      try {
+        return origPushState.apply(history, arguments);
+      } catch (_e) {
+        if (url && typeof url === 'string' && !url.startsWith('#')) {
+          try { window.location.hash = url; } catch (__e) {}
+        }
+      }
+    };
+    history.replaceState = function(state, title, url) {
+      try {
+        return origReplaceState.apply(history, arguments);
+      } catch (_e) {
+        if (url && typeof url === 'string' && !url.startsWith('#')) {
+          try { window.location.hash = url; } catch (__e) {}
+        }
+      }
+    };
+  } catch (_hErr) {}
+
+  try {
+    if (navigator.serviceWorker && navigator.serviceWorker.register) {
+      var origSwReg = navigator.serviceWorker.register.bind(navigator.serviceWorker);
+      navigator.serviceWorker.register = function() {
+        if (location.protocol === 'file:' || location.protocol === 'about:' || location.protocol === 'data:') {
+          return Promise.resolve({ scope: './', update: function(){}, unregister: function(){ return Promise.resolve(true); } });
+        }
+        return origSwReg.apply(navigator.serviceWorker, arguments).catch(function() {
+          return { scope: './', update: function(){}, unregister: function(){ return Promise.resolve(true); } };
+        });
+      };
+    }
+  } catch (_swErr) {}
+
+  // C. Virtual ZIP Asset & Data File Map (100% in-memory, zero network or file:// CORS needed)
   var assetDataUrls = ${safeJsonForHtmlScript(assetDataUrlMap)};
   var assetTexts = ${safeJsonForHtmlScript(assetTextMap)};
 
@@ -678,8 +925,20 @@ export function bundleMultiFileHtmlProject(
     return null;
   }
 
+  function dataUrlToBytes(dataUrl) {
+    var parts = dataUrl.split(',');
+    var mimeMatch = (parts[0] || '').match(/data:([^;]+)/);
+    var mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+    var bstr = atob(parts[1] || '');
+    var n = bstr.length;
+    var u8 = new Uint8Array(n);
+    for (var i = 0; i < n; i++) u8[i] = bstr.charCodeAt(i);
+    return { bytes: u8, mime: mime };
+  }
+
   window.__ZIP_LOOKUP_ASSET__ = lookupAsset;
 
+  // D. 100% Local window.fetch Interceptor (never calls network fetch for ZIP assets)
   var origFetch = window.fetch;
   if (origFetch) {
     window.fetch = function(input, init) {
@@ -688,10 +947,16 @@ export function bundleMultiFileHtmlProject(
         var found = lookupAsset(url);
         if (found) {
           if (found.type === 'dataUrl') {
-            return origFetch(found.value, init);
+            var decoded = dataUrlToBytes(found.value);
+            return Promise.resolve(new Response(decoded.bytes.buffer, {
+              status: 200,
+              statusText: 'OK',
+              headers: { 'Content-Type': decoded.mime }
+            }));
           }
           return Promise.resolve(new Response(found.value, {
             status: 200,
+            statusText: 'OK',
             headers: { 'Content-Type': url.endsWith('.json') ? 'application/json' : 'text/plain' }
           }));
         }
@@ -699,6 +964,101 @@ export function bundleMultiFileHtmlProject(
       return origFetch.apply(this, arguments);
     };
   }
+
+  // E. 100% Local XMLHttpRequest Interceptor (for games, Phaser, PixiJS, Three.js, JSON loaders on file://)
+  if (window.XMLHttpRequest) {
+    var origOpen = XMLHttpRequest.prototype.open;
+    var origSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(method, url) {
+      this.__zipLocalUrl = typeof url === 'string' ? url : '';
+      return origOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function() {
+      var xhr = this;
+      var url = xhr.__zipLocalUrl;
+      if (url && !/^(https?:|data:|blob:|\\/\\/)/i.test(url)) {
+        var found = lookupAsset(url);
+        if (found) {
+          setTimeout(function() {
+            try {
+              var rType = xhr.responseType || '';
+              var respVal = null;
+              var respText = '';
+
+              if (found.type === 'text') {
+                respText = found.value;
+                if (rType === 'json') {
+                  try { respVal = JSON.parse(found.value); } catch (_e) { respVal = null; }
+                } else if (rType === 'arraybuffer') {
+                  respVal = new TextEncoder().encode(found.value).buffer;
+                } else if (rType === 'blob') {
+                  respVal = new Blob([found.value], { type: 'text/plain' });
+                } else {
+                  respVal = found.value;
+                }
+              } else {
+                var dec = dataUrlToBytes(found.value);
+                if (rType === 'arraybuffer') {
+                  respVal = dec.bytes.buffer;
+                } else if (rType === 'blob') {
+                  respVal = new Blob([dec.bytes.buffer], { type: dec.mime });
+                } else {
+                  respVal = found.value;
+                  respText = found.value;
+                }
+              }
+
+              Object.defineProperty(xhr, 'readyState', { value: 4, configurable: true });
+              Object.defineProperty(xhr, 'status', { value: 200, configurable: true });
+              Object.defineProperty(xhr, 'statusText', { value: 'OK', configurable: true });
+              Object.defineProperty(xhr, 'response', { value: respVal, configurable: true });
+              if (!rType || rType === 'text') {
+                Object.defineProperty(xhr, 'responseText', { value: respText, configurable: true });
+              }
+
+              if (typeof xhr.onreadystatechange === 'function') xhr.onreadystatechange(new Event('readystatechange'));
+              xhr.dispatchEvent(new Event('readystatechange'));
+              if (typeof xhr.onload === 'function') xhr.onload(new ProgressEvent('load'));
+              xhr.dispatchEvent(new ProgressEvent('load'));
+              if (typeof xhr.onloadend === 'function') xhr.onloadend(new ProgressEvent('loadend'));
+              xhr.dispatchEvent(new ProgressEvent('loadend'));
+            } catch (_xhrErr) {}
+          }, 0);
+          return;
+        }
+      }
+      return origSend.apply(this, arguments);
+    };
+  }
+
+  // F. Intercept dynamic Image().src, Audio().src, Video().src, and DOM elements
+  function patchMediaSrcSetter(Proto) {
+    if (!Proto) return;
+    var desc = Object.getOwnPropertyDescriptor(Proto, 'src');
+    if (desc && desc.set && desc.configurable) {
+      Object.defineProperty(Proto, 'src', {
+        get: desc.get,
+        set: function(val) {
+          if (typeof val === 'string' && !/^(https?:|data:|blob:|\\/\\/)/i.test(val)) {
+            var found = lookupAsset(val);
+            if (found && found.type === 'dataUrl') {
+              return desc.set.call(this, found.value);
+            }
+          }
+          return desc.set.call(this, val);
+        },
+        configurable: true,
+        enumerable: desc.enumerable
+      });
+    }
+  }
+  try {
+    patchMediaSrcSetter(window.HTMLImageElement && HTMLImageElement.prototype);
+    patchMediaSrcSetter(window.HTMLMediaElement && HTMLMediaElement.prototype);
+    patchMediaSrcSetter(window.HTMLSourceElement && HTMLSourceElement.prototype);
+  } catch (_pErr) {}
 
   function resolveElementMedia(el) {
     if (!el || !el.getAttribute) return;
@@ -730,38 +1090,140 @@ export function bundleMultiFileHtmlProject(
 })();`;
     doc.head.insertBefore(vfsEl, doc.head.firstChild);
 
-    // 7. If the ZIP has ES module or TypeScript/React (.tsx/.ts/.jsx) entry scripts, append the live module runner
+    // 7. If the ZIP has multi-file ES modules or TypeScript/React (.tsx/.ts/.jsx),
+    // compile JS modules into a synchronous CommonJS bundle that runs inside a standard <script>
+    // (ZERO type="module" and ZERO blob: imports so it works 100% locally on file://!)
     if (entryScriptsToRun.length > 0) {
-      const needsBabel = files.some((f) => /\.(tsx|ts|jsx)$/i.test(f.name));
-      if (needsBabel) {
-        const babelScript = doc.createElement('script');
-        babelScript.setAttribute('src', 'https://unpkg.com/@babel/standalone/babel.min.js');
-        doc.body.appendChild(babelScript);
-      }
+      const hasTsxOrTs = files.some((f) => /\.(tsx|ts|jsx)$/i.test(f.name));
 
-      const sourceModulesMap: Record<string, string> = {};
-      for (const f of files) {
-        if (/\.(tsx|ts|jsx|js|mjs|cjs|json|css)$/i.test(f.name)) {
-          sourceModulesMap[f.path] = replaceAssetPathsInJs(f.textContent);
+      if (!hasTsxOrTs) {
+        // Pure multi-file JS/MJS/JSON/CSS ES Modules -> Pre-compile into synchronous CommonJS at bundle time!
+        // Runs 100% offline and locally on file:// with zero external dependencies!
+        const cjsModulesMap: Record<string, string> = {};
+        for (const f of files) {
+          const lower = f.name.toLowerCase();
+          if (/\.(js|mjs|cjs)$/.test(lower)) {
+            cjsModulesMap[f.path] = transformEsmToCommonJs(replaceAssetPathsInJs(f.textContent));
+          } else if (lower.endsWith('.json')) {
+            cjsModulesMap[f.path] = `module.exports = ${f.textContent || '{}'};`;
+          } else if (lower.endsWith('.css')) {
+            cjsModulesMap[f.path] = `module.exports = "";`;
+          }
         }
-      }
 
-      const runnerEl = doc.createElement('script');
-      runnerEl.setAttribute('type', 'module');
-      runnerEl.textContent = `(async function() {
-  const rawModules = ${safeJsonForHtmlScript(sourceModulesMap)};
-  const entryPaths = ${safeJsonForHtmlScript(entryScriptsToRun)};
-  const compiledBlobUrls = {};
-  const compilingPromises = {};
+        const localBundleEl = doc.createElement('script');
+        localBundleEl.id = 'webapk-local-cjs-bundle';
+        localBundleEl.textContent = `(function() {
+  var rawModules = ${safeJsonForHtmlScript(cjsModulesMap)};
+  var entryPaths = ${safeJsonForHtmlScript(entryScriptsToRun)};
+  var moduleCache = {};
 
-  function resolveLocalPath(fromFile, importSpec) {
-    let clean = importSpec.split('?')[0].split('#')[0];
+  function resolveModuleKey(fromFile, spec) {
+    var clean = String(spec || '').split('?')[0].split('#')[0];
     if (clean.startsWith('@/')) {
       clean = 'src/' + clean.slice(2);
     } else if (clean.startsWith('./') || clean.startsWith('../')) {
-      const dirParts = fromFile.split('/');
+      var dirParts = fromFile.split('/');
       dirParts.pop();
-      for (const seg of clean.split('/')) {
+      var segs = clean.split('/');
+      for (var i = 0; i < segs.length; i++) {
+        var s = segs[i];
+        if (!s || s === '.') continue;
+        if (s === '..') dirParts.pop();
+        else dirParts.push(s);
+      }
+      clean = dirParts.join('/');
+    } else if (clean.startsWith('/')) {
+      clean = clean.replace(/^\\/+/, '');
+    }
+
+    var exts = ['', '.js', '.mjs', '.cjs', '.json', '.css', '/index.js', '/index.mjs'];
+    var keys = Object.keys(rawModules);
+    for (var e = 0; e < exts.length; e++) {
+      var cand = (clean + exts[e]).toLowerCase();
+      for (var k = 0; k < keys.length; k++) {
+        if (keys[k].toLowerCase() === cand) return keys[k];
+      }
+    }
+    var base = clean.split('/').pop().toLowerCase();
+    for (var j = 0; j < keys.length; j++) {
+      if (keys[j].split('/').pop().toLowerCase() === base) return keys[j];
+    }
+    return null;
+  }
+
+  function execModule(modPath) {
+    if (moduleCache[modPath]) return moduleCache[modPath].exports;
+    var mod = { exports: {} };
+    moduleCache[modPath] = mod;
+    var code = rawModules[modPath] || '';
+
+    var localRequire = function(spec) {
+      var resolved = resolveModuleKey(modPath, spec);
+      if (resolved) return execModule(resolved);
+      if (window[spec]) return window[spec];
+      return {};
+    };
+
+    var localDynamicImport = function(spec) {
+      return Promise.resolve(localRequire(spec));
+    };
+
+    try {
+      var fn = new Function('module', 'exports', '__zipRequire', '__zipDynamicImport', code);
+      fn(mod, mod.exports, localRequire, localDynamicImport);
+    } catch (err) {
+      console.error('Error in local module ' + modPath + ':', err);
+    }
+    return mod.exports;
+  }
+
+  function startEntries() {
+    for (var i = 0; i < entryPaths.length; i++) {
+      var key = resolveModuleKey('', entryPaths[i]) || entryPaths[i];
+      if (rawModules[key] !== undefined) {
+        execModule(key);
+      }
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    window.addEventListener('DOMContentLoaded', startEntries);
+  } else {
+    startEntries();
+  }
+})();`;
+        doc.body.appendChild(localBundleEl);
+      } else {
+        // Unbuilt TypeScript/JSX (.tsx/.ts/.jsx) source archive -> compile via Babel Standalone into CommonJS
+        // (Zero blob: module imports so it works on file:// as well!)
+        const babelScript = doc.createElement('script');
+        babelScript.setAttribute('src', 'https://unpkg.com/@babel/standalone/babel.min.js');
+        doc.body.appendChild(babelScript);
+
+        const sourceModulesMap: Record<string, string> = {};
+        for (const f of files) {
+          if (/\.(tsx|ts|jsx|js|mjs|cjs|json|css)$/i.test(f.name)) {
+            sourceModulesMap[f.path] = replaceAssetPathsInJs(f.textContent);
+          }
+        }
+
+        const runnerEl = doc.createElement('script');
+        runnerEl.textContent = `(function() {
+  var rawModules = ${safeJsonForHtmlScript(sourceModulesMap)};
+  var entryPaths = ${safeJsonForHtmlScript(entryScriptsToRun)};
+  var moduleCache = {};
+
+  function resolveLocalPath(fromFile, importSpec) {
+    var clean = String(importSpec || '').split('?')[0].split('#')[0];
+    if (clean.startsWith('@/')) {
+      clean = 'src/' + clean.slice(2);
+    } else if (clean.startsWith('./') || clean.startsWith('../')) {
+      var dirParts = fromFile.split('/');
+      dirParts.pop();
+      var segs = clean.split('/');
+      for (var i = 0; i < segs.length; i++) {
+        var seg = segs[i];
         if (!seg || seg === '.') continue;
         if (seg === '..') dirParts.pop();
         else dirParts.push(seg);
@@ -773,104 +1235,87 @@ export function bundleMultiFileHtmlProject(
       return null;
     }
 
-    const exts = ['', '.tsx', '.ts', '.jsx', '.js', '.mjs', '.json', '/index.tsx', '/index.ts', '/index.jsx', '/index.js'];
-    for (const ext of exts) {
-      const cand = clean + ext;
-      const matchKey = Object.keys(rawModules).find(k => k.toLowerCase() === cand.toLowerCase());
-      if (matchKey) return matchKey;
+    var exts = ['', '.tsx', '.ts', '.jsx', '.js', '.mjs', '.json', '.css', '/index.tsx', '/index.ts', '/index.jsx', '/index.js'];
+    var keys = Object.keys(rawModules);
+    for (var e = 0; e < exts.length; e++) {
+      var cand = (clean + exts[e]).toLowerCase();
+      for (var k = 0; k < keys.length; k++) {
+        if (keys[k].toLowerCase() === cand) return keys[k];
+      }
     }
     return null;
   }
 
-  async function compileModule(filePath) {
-    if (compiledBlobUrls[filePath]) return compiledBlobUrls[filePath];
-    if (compilingPromises[filePath]) return compilingPromises[filePath];
+  function requireModule(fromFile, spec) {
+    if (/\\.css$/i.test(spec)) return {};
+    var localKey = fromFile ? resolveLocalPath(fromFile, spec) : (resolveLocalPath('', spec) || spec);
+    if (!localKey || rawModules[localKey] === undefined) {
+      if (spec === 'react' && window.React) return window.React;
+      if ((spec === 'react-dom' || spec === 'react-dom/client') && window.ReactDOM) return window.ReactDOM;
+      return window[spec] || {};
+    }
+    if (moduleCache[localKey]) return moduleCache[localKey].exports;
 
-    compilingPromises[filePath] = (async () => {
-      let code = rawModules[filePath] || '';
-      const lower = filePath.toLowerCase();
+    var mod = { exports: {} };
+    moduleCache[localKey] = mod;
+    var code = rawModules[localKey] || '';
+    var lower = localKey.toLowerCase();
 
-      if (lower.endsWith('.css')) {
-        const js = 'export default "";';
-        const url = URL.createObjectURL(new Blob([js], { type: 'text/javascript' }));
-        compiledBlobUrls[filePath] = url;
-        return url;
+    if (lower.endsWith('.json')) {
+      try { mod.exports = JSON.parse(code); } catch (_e) {}
+      return mod.exports;
+    }
+    if (lower.endsWith('.css')) {
+      return mod.exports;
+    }
+
+    if ((lower.endsWith('.tsx') || lower.endsWith('.jsx')) && !/\\bimport\\s+React\\b/.test(code)) {
+      code = 'import React from "react";\\n' + code;
+    }
+
+    if (window.Babel) {
+      try {
+        var res = window.Babel.transform(code, {
+          filename: localKey,
+          presets: [
+            ['env', { modules: 'commonjs' }],
+            ['typescript', { isTSX: lower.endsWith('.tsx'), allExtensions: true }],
+            ['react', { runtime: 'classic' }]
+          ]
+        });
+        if (res && res.code) code = res.code;
+      } catch (err) {
+        console.error('Babel compile error in ' + localKey + ':', err);
       }
+    }
 
-      if (lower.endsWith('.json')) {
-        const js = 'export default ' + code + ';';
-        const url = URL.createObjectURL(new Blob([js], { type: 'text/javascript' }));
-        compiledBlobUrls[filePath] = url;
-        return url;
-      }
+    var childRequire = function(childSpec) {
+      return requireModule(localKey, childSpec);
+    };
 
-      if ((lower.endsWith('.tsx') || lower.endsWith('.jsx')) && !/\\bimport\\s+React\\b/.test(code)) {
-        code = 'import React from "react";\\n' + code;
-      }
-
-      if (window.Babel && /\\.(tsx|ts|jsx)$/i.test(lower)) {
-        try {
-          const res = window.Babel.transform(code, {
-            filename: filePath,
-            presets: [
-              ['typescript', { isTSX: lower.endsWith('.tsx'), allExtensions: true }],
-              ['react', { runtime: 'classic' }]
-            ],
-            sourceType: 'module'
-          });
-          if (res && res.code) code = res.code;
-        } catch (err) {
-          console.error('Babel transform error in ' + filePath + ':', err);
-        }
-      }
-
-      const importRegex = /((?:import|export)\\s+(?:[\\w*{}\\s,]+\\s+from\\s+)?["'])([^"']+)(["'])/g;
-      const matches = Array.from(code.matchAll(importRegex));
-
-      for (const m of matches) {
-        const full = m[0];
-        const prefix = m[1];
-        const spec = m[2];
-        const suffix = m[3];
-
-        if (/^(https?:|data:|blob:)/i.test(spec)) continue;
-
-        if (/\\.css$/i.test(spec)) {
-          code = code.replace(full, '/* css imported */');
-          continue;
-        }
-
-        const localTarget = resolveLocalPath(filePath, spec);
-        if (localTarget) {
-          const targetUrl = await compileModule(localTarget);
-          code = code.split(prefix + spec + suffix).join(prefix + targetUrl + suffix);
-        } else {
-          const esmUrl =
-            spec === 'react' || spec === 'react-dom' || spec === 'react-dom/client'
-              ? 'https://esm.sh/' + spec + '@19.0.0'
-              : 'https://esm.sh/' + spec + '?deps=react@19.0.0,react-dom@19.0.0';
-          code = code.split(prefix + spec + suffix).join(prefix + esmUrl + suffix);
-        }
-      }
-
-      const blobUrl = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
-      compiledBlobUrls[filePath] = blobUrl;
-      return blobUrl;
-    })();
-
-    return compilingPromises[filePath];
+    try {
+      var fn = new Function('module', 'exports', 'require', code);
+      fn(mod, mod.exports, childRequire);
+    } catch (execErr) {
+      console.error('Execution error in ' + localKey + ':', execErr);
+    }
+    return mod.exports;
   }
 
-  for (const entry of entryPaths) {
-    try {
-      const rootUrl = await compileModule(entry);
-      await import(rootUrl);
-    } catch (e) {
-      console.error('Error executing ZIP module entry ' + entry + ':', e);
+  function bootTsxEntries() {
+    for (var i = 0; i < entryPaths.length; i++) {
+      requireModule('', entryPaths[i]);
     }
   }
+
+  if (document.readyState === 'loading') {
+    window.addEventListener('DOMContentLoaded', bootTsxEntries);
+  } else {
+    bootTsxEntries();
+  }
 })();`;
-      doc.body.appendChild(runnerEl);
+        doc.body.appendChild(runnerEl);
+      }
     }
 
     return '<!DOCTYPE html>\n' + doc.documentElement.outerHTML;

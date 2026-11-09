@@ -189,11 +189,14 @@ export const HtmlViewerWorkspace: React.FC<HtmlViewerWorkspaceProps> = ({
   };
 
   const handleDownloadSource = () => {
-    const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
+    const blob = new Blob([renderedHtmlPreview], { type: 'text/html;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = htmlFileName || 'index.html';
+    const baseOutName = importedZip
+      ? `${importedZip.zipFileName.replace(/\.zip$/i, '')}-standalone.html`
+      : htmlFileName || 'index.html';
+    a.download = baseOutName.endsWith('.html') || baseOutName.endsWith('.htm') ? baseOutName : `${baseOutName}.html`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
