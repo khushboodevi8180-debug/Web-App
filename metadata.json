@@ -1,0 +1,6 @@
+{
+  "name": "WebAPK Studio — HTML Viewer & APK Converter",
+  "description": "Load and execute local HTML documents in an interactive sandbox or package HTML applications with custom icons and metadata into downloadable Android APK files.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
